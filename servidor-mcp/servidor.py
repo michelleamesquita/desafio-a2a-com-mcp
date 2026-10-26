@@ -1,256 +1,328 @@
 #!/usr/bin/env python3
-"""Servidor MCP Streamable HTTP da Central de Salas."""
+"""Servidor MCP da Central de Salas (Streamable HTTP, SDK oficial `mcp` v2).
+
+Tudo que o enunciado chama de protocolo vem do SDK: transporte, validacao do
+`_meta` e dos headers, `resultType`, e a protecao do `requestState`. O que este
+arquivo escreve e o dominio (tres tools, um resource) e a decisao de quando uma
+reserva precisa perguntar algo ao usuario.
+
+Variaveis de ambiente:
+    REQUEST_STATE_SECRET  obrigatoria, no minimo 32 bytes de aleatoriedade.
+    MCP_HOST / MCP_PORT   padrao 127.0.0.1 / 7301.
+"""
+
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
 import os
-import secrets
 import sys
-import time
-from datetime import datetime, time as dtime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.request_state import RequestStateSecurity
+from mcp.shared.exceptions import MCPError
+from mcp_types import (
+    INVALID_PARAMS,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
+    ClientCapabilities,
+    ElicitationCapability,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    FormElicitationCapability,
+    InputRequiredResult,
+    MissingRequiredClientCapabilityErrorData,
+)
+from pydantic import BaseModel
+
+RAIZ = Path(__file__).resolve().parents[1]
+HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_PORT", "7301"))
-PROTOCOL = "2026-07-28"
-SECRET_TEXT = os.environ.get("REQUEST_STATE_SECRET", "")
-SECRET = SECRET_TEXT.encode()
-if len(SECRET) < 32:
-    raise SystemExit("REQUEST_STATE_SECRET deve ter no minimo 32 bytes")
 
-with (ROOT / "dados/salas.json").open(encoding="utf-8") as f:
-    SALAS = json.load(f)
-with (ROOT / "dados/reservas.json").open(encoding="utf-8") as f:
-    RESERVAS: list[dict[str, Any]] = json.load(f)
-with (ROOT / "dados/politica-de-uso.md").open(encoding="utf-8") as f:
-    POLITICA_TEXTO = f.read()
-POLITICA = POLITICA_TEXTO.splitlines()[0].split(":", 1)[1].strip()
-SALA_POR_ID = {s["id"]: s for s in SALAS}
-RESERVA_NUMERO = max(int(r["id"].split("-")[-1]) for r in RESERVAS) + 1
+# O estado do requestState vale 15 minutos: dentro da faixa de 5 a 30 que o enunciado exige.
+TTL_REQUEST_STATE = 15 * 60
+CHAVE_ELICITATION = "escolha_de_sala"
+
+FUSO = timezone(timedelta(hours=-3))  # horario de Sao Paulo, o da politica
+ABERTURA, FECHAMENTO = 8, 20
+DURACAO_MAXIMA = timedelta(hours=2)
+
+ERRO_JANELA = "Fora da janela de uso: a politica permite reservas entre 08:00 e 20:00"
+ERRO_DURACAO = "Duracao acima do limite: a politica permite no maximo 2 horas"
+ERRO_INTERVALO = "Intervalo invalido: fim deve ser posterior a inicio"
+ERRO_SEM_ALTERNATIVA = "Sem alternativas disponiveis no intervalo"
 
 
-def resposta_error(req_id: Any, code: int, message: str, data: Any = None) -> dict:
-    error = {"code": code, "message": message}
-    if data is not None:
-        error["data"] = data
-    return {"jsonrpc": "2.0", "id": req_id, "error": error}
+def ler_segredo() -> str:
+    """O segredo do requestState vem so do ambiente; sem ele o processo nao sobe."""
+    segredo = os.environ.get("REQUEST_STATE_SECRET", "")
+    if len(segredo.encode()) < 32:
+        sys.exit(
+            "REQUEST_STATE_SECRET ausente ou com menos de 32 bytes. Gere uma com:\n"
+            "  export REQUEST_STATE_SECRET=\"$(python3 -c 'import secrets; print(secrets.token_hex(32))')\""
+        )
+    return segredo
 
 
-def texto_resultado(data: dict, is_error: bool = False) -> dict:
-    result = {
-        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
-        "resultType": "complete",
-        "structuredContent": data,
-    }
-    if is_error:
-        result["isError"] = True
-    return result
+# --------------------------------------------------------------------------- dados
+
+SALAS: list[dict[str, Any]] = json.loads((RAIZ / "dados/salas.json").read_text(encoding="utf-8"))
+RESERVAS: list[dict[str, Any]] = json.loads((RAIZ / "dados/reservas.json").read_text(encoding="utf-8"))
+POLITICA_TEXTO = (RAIZ / "dados/politica-de-uso.md").read_text(encoding="utf-8")
+POLITICA_VERSAO = POLITICA_TEXTO.splitlines()[0].split(":", 1)[1].strip()
+SALA_POR_ID = {sala["id"]: sala for sala in SALAS}
+_proximo_numero = max(int(r["id"].rsplit("-", 1)[1]) for r in RESERVAS) + 1
 
 
-def parse_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+class SalaOut(BaseModel):
+    id: str
+    nome: str
+    capacidade: int
+    recursos: list[str]
 
 
-def validar_intervalo(sala: str, inicio: str, fim: str) -> tuple[datetime, datetime] | str:
+class ListaDeSalas(BaseModel):
+    salas: list[SalaOut]
+
+
+class ConflitoOut(BaseModel):
+    id: str
+    inicio: str
+    fim: str
+    responsavel: str
+
+
+class Disponibilidade(BaseModel):
+    sala: str
+    livre: bool
+    conflitos: list[ConflitoOut]
+
+
+class ReservaOut(BaseModel):
+    reserva: str | None = None
+    reservado: bool = True
+    sala: str | None = None
+    inicio: str | None = None
+    fim: str | None = None
+    responsavel: str | None = None
+    politica: str | None = None
+    motivo: str | None = None
+
+
+# ------------------------------------------------------------------------ dominio
+
+
+def _instante(texto: str) -> datetime:
+    momento = datetime.fromisoformat(texto)
+    return momento if momento.tzinfo else momento.replace(tzinfo=FUSO)
+
+
+def validar(sala: str, inicio: str, fim: str) -> tuple[datetime, datetime]:
+    """As mesmas validacoes para consulta e reserva; devolve o intervalo ou levanta ToolError."""
     if sala not in SALA_POR_ID:
-        return f"Sala inexistente: {sala}"
+        raise ToolError(f"Sala inexistente: {sala}")
     try:
-        a, b = parse_dt(inicio), parse_dt(fim)
+        a, b = _instante(inicio), _instante(fim)
     except (TypeError, ValueError):
-        return "Intervalo invalido: fim deve ser posterior a inicio"
+        raise ToolError(ERRO_INTERVALO) from None
     if b <= a:
-        return "Intervalo invalido: fim deve ser posterior a inicio"
-    if a.timetz().replace(tzinfo=None) < dtime(8) or b.timetz().replace(tzinfo=None) > dtime(20):
-        return "Fora da janela de uso: a politica permite reservas entre 08:00 e 20:00"
-    if b - a > timedelta(hours=2):
-        return "Duracao acima do limite: a politica permite no maximo 2 horas"
+        raise ToolError(ERRO_INTERVALO)
+    dia = a.astimezone(FUSO).replace(hour=0, minute=0, second=0, microsecond=0)
+    abre, fecha = dia + timedelta(hours=ABERTURA), dia + timedelta(hours=FECHAMENTO)
+    if a < abre or b > fecha:
+        raise ToolError(ERRO_JANELA)
+    if b - a > DURACAO_MAXIMA:
+        raise ToolError(ERRO_DURACAO)
     return a, b
 
 
-def conflitos(sala: str, inicio: datetime, fim: datetime) -> list[dict]:
-    found = []
-    for reserva in RESERVAS:
-        if reserva["sala"] != sala:
-            continue
-        a, b = parse_dt(reserva["inicio"]), parse_dt(reserva["fim"])
-        if a < fim and b > inicio:
-            found.append({k: reserva[k] for k in ("id", "inicio", "fim", "responsavel")})
-    return found
-
-
-def alternativas(sala: str, inicio: datetime, fim: datetime) -> list[str]:
-    capacidade = SALA_POR_ID[sala]["capacidade"]
-    candidatas = [
-        s for s in SALAS
-        if s["capacidade"] >= capacidade and not conflitos(s["id"], inicio, fim)
-    ]
-    candidatas.sort(key=lambda s: (s["capacidade"], s["id"]))
-    return [s["id"] for s in candidatas[:3]]
-
-
-def seal(payload: dict) -> str:
-    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-    encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-    mac = hmac.new(SECRET, encoded.encode(), hashlib.sha256).digest()
-    return "v1." + encoded + "." + base64.urlsafe_b64encode(mac).rstrip(b"=").decode()
-
-
-def unseal(value: str) -> dict:
-    try:
-        version, encoded, signature = value.split(".", 2)
-        if version != "v1":
-            raise ValueError
-        expected = hmac.new(SECRET, encoded.encode(), hashlib.sha256).digest()
-        supplied = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
-        if not hmac.compare_digest(expected, supplied):
-            raise ValueError
-        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-        payload = json.loads(raw)
-        if payload["exp"] < int(time.time()):
-            raise ValueError
-        return payload
-    except (ValueError, KeyError, TypeError):
-        raise ValueError("requestState invalido ou expirado")
-
-
-def tool_definitions() -> list[dict]:
-    common = {"type": "object"}
+def conflitos_da_sala(sala: str, a: datetime, b: datetime) -> list[dict[str, Any]]:
     return [
-        {"name": "listar_salas", "description": "Lista todas as salas com capacidade e recursos.",
-         "inputSchema": {**common, "properties": {}},
-         "outputSchema": {"type": "object", "properties": {"salas": {"type": "array"}}, "required": ["salas"]}},
-        {"name": "consultar_disponibilidade", "description": "Diz se uma sala esta livre no intervalo, e quais reservas conflitam.",
-         "inputSchema": {"type": "object", "properties": {"sala": {"type": "string"}, "inicio": {"type": "string"}, "fim": {"type": "string"}}, "required": ["sala", "inicio", "fim"]},
-         "outputSchema": {"type": "object", "properties": {"sala": {"type": "string"}, "livre": {"type": "boolean"}, "conflitos": {"type": "array"}}, "required": ["sala", "livre", "conflitos"]}},
-        {"name": "reservar_sala", "description": "Reserva uma sala. Se o intervalo estiver ocupado, pergunta qual alternativa usar.",
-         "inputSchema": {"type": "object", "properties": {"sala": {"type": "string"}, "inicio": {"type": "string"}, "fim": {"type": "string"}, "responsavel": {"type": "string"}}, "required": ["sala", "inicio", "fim", "responsavel"]},
-         "outputSchema": {"type": "object", "properties": {"reserva": {"type": ["string", "null"]}, "reservado": {"type": "boolean"}, "sala": {"type": ["string", "null"]}, "inicio": {"type": ["string", "null"]}, "fim": {"type": ["string", "null"]}, "responsavel": {"type": ["string", "null"]}, "politica": {"type": ["string", "null"]}}}},
+        r
+        for r in RESERVAS
+        if r["sala"] == sala and _instante(r["inicio"]) < b and _instante(r["fim"]) > a
     ]
 
 
-def call_tool(name: str, args: dict, params: dict) -> dict:
-    global RESERVA_NUMERO
-    if name == "listar_salas":
-        return texto_resultado({"salas": SALAS})
-    if name not in {"consultar_disponibilidade", "reservar_sala"}:
-        raise LookupError("Tool inexistente")
-    required = ("sala", "inicio", "fim")
-    if any(k not in args for k in required):
-        return texto_resultado({"motivo": "argumentos invalidos"}, True)
-    valid = validar_intervalo(args["sala"], args["inicio"], args["fim"])
-    if isinstance(valid, str):
-        return texto_resultado({"motivo": valid}, True)
-    inicio, fim = valid
-    found = conflitos(args["sala"], inicio, fim)
-    if name == "consultar_disponibilidade":
-        return texto_resultado({"sala": args["sala"], "livre": not found, "conflitos": found})
-    if "requestState" in params:
-        try:
-            sealed = unseal(params["requestState"])
-        except ValueError as exc:
-            raise ValueError(str(exc))
-        original = sealed["arguments"]
-        if original != args:
-            args = original
-            valid = validar_intervalo(args["sala"], args["inicio"], args["fim"])
-            if isinstance(valid, str):
-                return texto_resultado({"motivo": valid}, True)
-            inicio, fim = valid
-        responses = params.get("inputResponses") or {}
-        response = next(iter(responses.values()), {})
-        action = response.get("action")
-        if action in {"decline", "cancel"}:
-            return texto_resultado({"reserva": None, "reservado": False, "sala": args["sala"], "inicio": args["inicio"], "fim": args["fim"], "responsavel": args["responsavel"], "politica": POLITICA, "motivo": "recusado"})
-        chosen = ((response.get("content") or {}).get("sala"))
-        if action != "accept" or chosen not in sealed["alternatives"]:
-            raise ValueError("escolha de sala invalida")
-        args = {**args, "sala": chosen}
-        found = conflitos(chosen, inicio, fim)
-    if found:
-        caps = (params.get("_meta") or {}).get("io.modelcontextprotocol/clientCapabilities") or {}
-        if not isinstance(caps.get("elicitation"), dict) or not isinstance(caps["elicitation"].get("form"), dict):
-            raise PermissionError("cliente nao declarou elicitation em form mode")
-        choices = alternativas(args["sala"], inicio, fim)
-        if not choices:
-            return texto_resultado({"motivo": "Sem alternativas disponiveis no intervalo"}, True)
-        key = "servidor:escolha_de_sala"
-        state = seal({"exp": int(time.time()) + 900, "arguments": args, "alternatives": choices})
-        return {"resultType": "input_required", "inputRequests": {key: {"method": "elicitation/create", "params": {"mode": "form", "message": "A sala pedida esta ocupada nesse intervalo. Escolha uma alternativa.", "requestedSchema": {"type": "object", "properties": {"sala": {"type": "string", "enum": choices}}, "required": ["sala"]}}}}, "requestState": state}
-    reserva = {"reserva": f"res-{RESERVA_NUMERO:04d}", "reservado": True, "sala": args["sala"], "inicio": args["inicio"], "fim": args["fim"], "responsavel": args["responsavel"], "politica": POLITICA, "motivo": None}
-    RESERVA_NUMERO += 1
-    RESERVAS.append({"id": reserva["reserva"], **{k: reserva[k] for k in ("sala", "inicio", "fim", "responsavel")}})
-    return texto_resultado(reserva)
+def alternativas(sala: str, a: datetime, b: datetime) -> list[str]:
+    """Salas livres com capacidade igual ou maior, por capacidade e depois id, no maximo tres."""
+    minima = SALA_POR_ID[sala]["capacidade"]
+    livres = [s for s in SALAS if s["capacidade"] >= minima and not conflitos_da_sala(s["id"], a, b)]
+    livres.sort(key=lambda s: (s["capacidade"], s["id"]))
+    return [s["id"] for s in livres[:3]]
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "central-de-salas/1.0"
+def criar_reserva(sala: str, inicio: str, fim: str, responsavel: str) -> ReservaOut:
+    global _proximo_numero
+    reserva = f"res-{_proximo_numero:04d}"
+    _proximo_numero += 1
+    RESERVAS.append({"id": reserva, "sala": sala, "inicio": inicio, "fim": fim, "responsavel": responsavel})
+    return ReservaOut(
+        reserva=reserva, sala=sala, inicio=inicio, fim=fim, responsavel=responsavel, politica=POLITICA_VERSAO
+    )
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        # O contrato exige que o log operacional vá para stderr em formato próprio.
-        pass
 
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        try:
-            body = json.loads(self.rfile.read(length))
-            req_id = body.get("id")
-            params = body.get("params") or {}
-            method = body.get("method")
-            meta = params.get("_meta") or {}
-            trace = meta.get("traceparent", "-")
-            print(f"method={method} id={req_id} traceparent={trace}", file=sys.stderr, flush=True)
-            if self.path != "/mcp":
-                raise LookupError("endpoint inexistente")
-            capabilities = meta.get("io.modelcontextprotocol/clientCapabilities")
-            if meta.get("io.modelcontextprotocol/protocolVersion") != PROTOCOL or not isinstance(capabilities, dict):
-                self.finish_json(resposta_error(req_id, -32602, "metadados MCP obrigatorios ausentes"), 400)
-                return
-            if self.headers.get("MCP-Protocol-Version") != meta["io.modelcontextprotocol/protocolVersion"] or self.headers.get("Mcp-Method") != method:
-                self.finish_json(resposta_error(req_id, -32020, "headers MCP nao correspondem ao corpo"), 400)
-                return
-            if method in {"tools/call", "resources/read"} and self.headers.get("Mcp-Name") != (params.get("name") or params.get("uri")):
-                self.finish_json(resposta_error(req_id, -32020, "Mcp-Name nao corresponde ao corpo"), 400)
-                return
-            if method == "tools/list":
-                result = {"resultType": "complete", "tools": tool_definitions()}
-            elif method == "resources/read":
-                if params.get("uri") != "politica://uso":
-                    self.finish_json(resposta_error(req_id, -32602, "resource inexistente"), 400)
-                    return
-                result = {"resultType": "complete", "contents": [{"uri": "politica://uso", "mimeType": "text/markdown", "text": POLITICA_TEXTO}]}
-            elif method == "tools/call":
-                try:
-                    result = call_tool(params.get("name"), params.get("arguments") or {}, params)
-                except LookupError:
-                    self.finish_json(resposta_error(req_id, -32602, "Tool inexistente"), 400)
-                    return
-                except PermissionError:
-                    self.finish_json(resposta_error(req_id, -32021, "capability de elicitation ausente", {"requiredCapabilities": ["elicitation.form"]}), 400)
-                    return
-                except ValueError as exc:
-                    self.finish_json(resposta_error(req_id, -32602, str(exc)), 400)
-                    return
-            else:
-                self.finish_json(resposta_error(req_id, -32601, "metodo inexistente"), 400)
-                return
-            self.finish_json({"jsonrpc": "2.0", "id": req_id, "result": result})
-        except Exception as exc:
-            self.finish_json(resposta_error(None, -32700, str(exc)), 400)
+def exigir_elicitation_form(ctx: Context) -> None:
+    """-32021 quando o cliente nao declarou elicitation em form mode, nesta mesma request."""
+    capacidades = ctx.client_capabilities
+    elicitation = capacidades.elicitation if capacidades is not None else None
+    if elicitation is not None and elicitation.form is not None:
+        return
+    exigida = ClientCapabilities(elicitation=ElicitationCapability(form=FormElicitationCapability()))
+    raise MCPError(
+        code=MISSING_REQUIRED_CLIENT_CAPABILITY,
+        message="Client did not declare the form elicitation capability required by reservar_sala",
+        data=MissingRequiredClientCapabilityErrorData(required_capabilities=exigida).model_dump(
+            by_alias=True, mode="json", exclude_none=True
+        ),
+    )
 
-    def finish_json(self, body: dict, status: int = 200) -> None:
-        raw = json.dumps(body, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+
+# -------------------------------------------------------------------------- tools
+
+
+def criar_servidor() -> MCPServer:
+    mcp = MCPServer(
+        "central-de-salas",
+        version="1.0.0",
+        request_state_security=RequestStateSecurity(keys=[ler_segredo()], ttl=TTL_REQUEST_STATE),
+    )
+
+    @mcp.tool()
+    def listar_salas() -> ListaDeSalas:
+        """Lista todas as salas com capacidade e recursos."""
+        return ListaDeSalas(salas=[SalaOut(**s) for s in SALAS])
+
+    @mcp.tool()
+    def consultar_disponibilidade(sala: str, inicio: str, fim: str) -> Disponibilidade:
+        """Diz se uma sala esta livre no intervalo, e quais reservas conflitam."""
+        a, b = validar(sala, inicio, fim)
+        achados = conflitos_da_sala(sala, a, b)
+        return Disponibilidade(
+            sala=sala, livre=not achados, conflitos=[ConflitoOut(**{k: r[k] for k in ConflitoOut.model_fields}) for r in achados]
+        )
+
+    @mcp.tool()
+    def reservar_sala(
+        sala: str, inicio: str, fim: str, responsavel: str, ctx: Context
+    ) -> ReservaOut | InputRequiredResult:
+        """Reserva uma sala. Se o intervalo estiver ocupado, pergunta qual alternativa usar."""
+        a, b = validar(sala, inicio, fim)
+
+        if ctx.request_state is not None:
+            return concluir_reserva(ctx, sala, inicio, fim, responsavel, a, b)
+
+        if not conflitos_da_sala(sala, a, b):
+            return criar_reserva(sala, inicio, fim, responsavel)
+
+        # Conflito. Sem elicitation declarada nao ha como perguntar: -32021.
+        exigir_elicitation_form(ctx)
+        opcoes = alternativas(sala, a, b)
+        if not opcoes:
+            raise ToolError(ERRO_SEM_ALTERNATIVA)
+        # O servidor nao guarda nada: as opcoes oferecidas viajam no requestState, que o
+        # SDK sela (AES-256-GCM), vincula a esta chamada e expira.
+        pergunta = ElicitRequest(
+            params=ElicitRequestFormParams(
+                message="A sala pedida esta ocupada nesse intervalo. Escolha uma alternativa.",
+                requested_schema={
+                    "type": "object",
+                    "properties": {"sala": {"type": "string", "enum": opcoes}},
+                    "required": ["sala"],
+                },
+            )
+        )
+        return InputRequiredResult(
+            input_requests={CHAVE_ELICITATION: pergunta},
+            request_state=json.dumps({"alternativas": opcoes}),
+        )
+
+    def concluir_reserva(
+        ctx: Context, sala: str, inicio: str, fim: str, responsavel: str, a: datetime, b: datetime
+    ) -> ReservaOut:
+        """Retry: o estado ja foi verificado pelo SDK; aqui so se le a resposta da elicitation."""
+        oferecidas = json.loads(ctx.request_state or "{}").get("alternativas", [])
+        resposta = (ctx.input_responses or {}).get(CHAVE_ELICITATION)
+        if resposta is None:
+            raise MCPError(code=INVALID_PARAMS, message="inputResponses sem a resposta esperada")
+        if resposta.action != "accept":  # decline ou cancel nao e erro: conclui sem reservar
+            return ReservaOut(
+                reservado=False, sala=sala, inicio=inicio, fim=fim, responsavel=responsavel,
+                politica=POLITICA_VERSAO, motivo="Reserva recusada pelo usuario",
+            )
+        escolhida = (resposta.content or {}).get("sala")
+        if escolhida not in oferecidas:
+            raise MCPError(code=INVALID_PARAMS, message="Sala escolhida fora das alternativas oferecidas")
+        if conflitos_da_sala(escolhida, a, b):
+            raise ToolError(ERRO_SEM_ALTERNATIVA)
+        return criar_reserva(escolhida, inicio, fim, responsavel)
+
+    @mcp.resource("politica://uso", name="politica-de-uso", mime_type="text/markdown")
+    def politica_de_uso() -> str:
+        """Politica de uso das salas; a primeira linha declara a versao."""
+        return POLITICA_TEXTO
+
+    return mcp
+
+
+def registrar(corpo: bytes) -> None:
+    """Uma linha no stderr por request: metodo, id e traceparent (quando vier no _meta)."""
+    try:
+        mensagem = json.loads(corpo)
+        params = mensagem.get("params") or {}
+        meta = params.get("_meta") or {}
+        linha = f"metodo={mensagem.get('method')} id={mensagem.get('id')} traceparent={meta.get('traceparent', '-')}"
+    except (ValueError, AttributeError):
+        linha = "metodo=? id=? traceparent=- (corpo nao e um request JSON-RPC)"
+    print(f"request {linha}", file=sys.stderr, flush=True)
+
+
+class RegistroDeRequests:
+    """Camada ASGI externa ao SDK.
+
+    O log fica aqui, e nao num middleware do SDK, porque o SDK recusa no transporte
+    (antes de qualquer middleware) um request sem `_meta` ou com header divergente, e
+    esses tambem precisam aparecer no stderr.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or scope["method"] != "POST":
+            await self.app(scope, receive, send)
+            return
+        corpo = b""
+        while True:
+            evento = await receive()
+            if evento["type"] != "http.request":
+                break
+            corpo += evento.get("body", b"")
+            if not evento.get("more_body"):
+                break
+        registrar(corpo)
+        entregue = False
+
+        async def reenviar() -> Any:
+            nonlocal entregue
+            if entregue:
+                return await receive()
+            entregue = True
+            return {"type": "http.request", "body": corpo, "more_body": False}
+
+        await self.app(scope, reenviar, send)
+
+
+def criar_app() -> Any:
+    # stateless_http: nenhum request depende de sessao ou de request anterior.
+    return RegistroDeRequests(criar_servidor().streamable_http_app(host=HOST, stateless_http=True))
 
 
 if __name__ == "__main__":
-    print(f"servidor MCP ouvindo em http://localhost:{PORT}/mcp", file=sys.stderr, flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    import uvicorn
+
+    app = criar_app()  # falha cedo, antes de abrir a porta, se REQUEST_STATE_SECRET faltar
+    print(f"servidor MCP em http://{HOST}:{PORT}/mcp", file=sys.stderr, flush=True)
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")

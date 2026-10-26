@@ -1,12 +1,14 @@
 [build-system]
-requires = ["setuptools>=68,<76"]
+requires = ["setuptools>=68,<83"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "desafio-a2a-com-mcp"
 version = "1.0.0"
-description = "Ponte deterministica entre A2A e MCP"
+description = "A Ponte: agente A2A com MCP por dentro (Hill Valley Tech)"
 requires-python = ">=3.10"
+# SDK oficial do MCP na v2, alinhado a revisao 2026-07-28. O agente usa apenas a
+# biblioteca padrao e nao depende de nenhum SDK de LLM.
 dependencies = [
     "mcp==2.3.0",
 ]
