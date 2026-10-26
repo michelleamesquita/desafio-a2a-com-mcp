@@ -10,7 +10,7 @@ import os
 import secrets
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -67,7 +67,7 @@ def validar_intervalo(sala: str, inicio: str, fim: str) -> tuple[datetime, datet
         return "Intervalo invalido: fim deve ser posterior a inicio"
     if a.timetz().replace(tzinfo=None) < dtime(8) or b.timetz().replace(tzinfo=None) > dtime(20):
         return "Fora da janela de uso: a politica permite reservas entre 08:00 e 20:00"
-    if b - a > __import__("datetime").timedelta(hours=2):
+    if b - a > timedelta(hours=2):
         return "Duracao acima do limite: a politica permite no maximo 2 horas"
     return a, b
 
@@ -206,7 +206,8 @@ class Handler(BaseHTTPRequestHandler):
             print(f"method={method} id={req_id} traceparent={trace}", file=sys.stderr, flush=True)
             if self.path != "/mcp":
                 raise LookupError("endpoint inexistente")
-            if meta.get("io.modelcontextprotocol/protocolVersion") != PROTOCOL or "io.modelcontextprotocol/clientCapabilities" not in meta:
+            capabilities = meta.get("io.modelcontextprotocol/clientCapabilities")
+            if meta.get("io.modelcontextprotocol/protocolVersion") != PROTOCOL or not isinstance(capabilities, dict):
                 self.finish_json(resposta_error(req_id, -32602, "metadados MCP obrigatorios ausentes"), 400)
                 return
             if self.headers.get("MCP-Protocol-Version") != meta["io.modelcontextprotocol/protocolVersion"] or self.headers.get("Mcp-Method") != method:

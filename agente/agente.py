@@ -94,7 +94,10 @@ def run_mcp(task: dict, args: dict, response: dict | None = None) -> None:
         task.update({"state": "TASK_STATE_FAILED", "status_message": " ".join(p.get("text", "") for p in result.get("content", []))})
         return
     data = result.get("structuredContent") or {}
-    task.update({"state": "TASK_STATE_COMPLETED", "artifacts": [{"name": "reserva", "parts": [{"text": json.dumps({k: data[k] for k in ("reserva", "sala", "inicio", "fim", "responsavel", "politica")}, ensure_ascii=False, separators=(",", ":"))}]}], "status_message": "Reserva concluida."})
+    politica = policy_version or data.get("politica")
+    artifact = {k: data[k] for k in ("reserva", "sala", "inicio", "fim", "responsavel")}
+    artifact["politica"] = politica
+    task.update({"state": "TASK_STATE_COMPLETED", "artifacts": [{"name": "reserva", "parts": [{"text": json.dumps(artifact, ensure_ascii=False, separators=(",", ":"))}]}], "status_message": "Reserva concluida."})
 
 
 def process_send(params: dict, traceparent: str | None) -> dict:

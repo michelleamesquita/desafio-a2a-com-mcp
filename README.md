@@ -467,6 +467,7 @@ No fim, o que este desafio cobra em uma frase: o seu agente precisa ter profundi
 A partir da raiz de um clone limpo, gere uma chave nova e abra dois terminais:
 
 ```bash
+python3 -m pip install .
 export REQUEST_STATE_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 python3 servidor-mcp/servidor.py
 ```
@@ -485,6 +486,8 @@ python3 validador/validar.py --agente http://localhost:7300 --mcp http://localho
 
 O servidor MCP é um processo independente em Streamable HTTP (`/mcp`). O agente é outro processo, exposto em `/a2a`, e fala com o MCP somente por HTTP.
 
+O projeto fixa o SDK oficial Python `mcp==2.3.0` no `pyproject.toml`. A camada de transporte deste desafio mantém o wire MCP explícito porque o SDK disponível não expõe o formato MRTR `input_required`/`requestState` exigido pelo contrato da revisão `2026-07-28`; esse limite foi verificado no pacote instalado: ele oferece elicitation callback e tasks, mas não um campo `requestState` no cliente/servidor. O agente não usa callback de elicitation, para que a pausa atravesse a fronteira A2A.
+
 ## Onde a ponte acontece
 
 Em `agente/agente.py`, `run_mcp` detecta `resultType=input_required`, extrai somente o schema da elicitation para montar a mensagem `alternativas: ...` e guarda o `requestState` opaco na Task. Na continuação, `process_send` envia um novo `tools/call`, com id novo gerado por `call_mcp`, a mesma chave em `inputResponses` e o estado selado ecoado sem interpretação.
@@ -498,7 +501,7 @@ Em `agente/agente.py`, `run_mcp` detecta `resultType=input_required`, extrai som
 Última execução, com os dois processos recém-iniciados:
 
 ```text
-trace-id desta execucao: b99fd22852bbb720ea07fe5dc1054ecf
+trace-id desta execucao: cf980808aabb6ebde4e6598ea23e6a8f
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools
