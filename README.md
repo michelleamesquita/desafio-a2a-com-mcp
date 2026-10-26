@@ -461,3 +461,82 @@ Sobre o `requestState`, a pergunta que separa a entrega boa da entrega ingênua 
 O instrumento de depuração deste desafio é o stderr do servidor MCP com o Inspector aberto ao lado. Quase todo problema de ponte aparece ali em segundos: o `tools/list` que nunca acontece, o `_meta` sem capability, o `traceparent` que o agente esqueceu de propagar, o retry com o id repetido.
 
 No fim, o que este desafio cobra em uma frase: o seu agente precisa ter profundidade por dentro e alcance por fora, e a única coisa que atravessa essa fronteira é estado nomeado explicitamente.
+
+## Como rodar
+
+A partir da raiz de um clone limpo, gere uma chave nova e abra dois terminais:
+
+```bash
+export REQUEST_STATE_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+python3 servidor-mcp/servidor.py
+```
+
+No segundo terminal:
+
+```bash
+MCP_URL=http://localhost:7301/mcp python3 agente/agente.py
+```
+
+Com os dois processos ativos, execute:
+
+```bash
+python3 validador/validar.py --agente http://localhost:7300 --mcp http://localhost:7301
+```
+
+O servidor MCP é um processo independente em Streamable HTTP (`/mcp`). O agente é outro processo, exposto em `/a2a`, e fala com o MCP somente por HTTP.
+
+## Onde a ponte acontece
+
+Em `agente/agente.py`, `run_mcp` detecta `resultType=input_required`, extrai somente o schema da elicitation para montar a mensagem `alternativas: ...` e guarda o `requestState` opaco na Task. Na continuação, `process_send` envia um novo `tools/call`, com id novo gerado por `call_mcp`, a mesma chave em `inputResponses` e o estado selado ecoado sem interpretação.
+
+## Decisões técnicas
+
+`servidor-mcp/servidor.py` protege o `requestState` com HMAC-SHA256, usando exclusivamente `REQUEST_STATE_SECRET`, e inclui expiração de 15 minutos. O payload assinado contém os argumentos originais e as alternativas; assim, argumentos adulterados no retry não prevalecem. O estado das Tasks fica em memória no agente; as reservas também ficam em memória no servidor MCP. A política é lida pelo agente via `resources/read` antes da primeira tool call.
+
+## Saída do validador
+
+Última execução, com os dois processos recém-iniciados:
+
+```text
+trace-id desta execucao: b99fd22852bbb720ea07fe5dc1054ecf
+procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
+
+PASS 01 tools/list traz as tres tools
+PASS 02 toda tool tem inputSchema de objeto
+PASS 03 listar_salas devolve structuredContent e o mesmo JSON em texto
+PASS 04 _meta sem protocolVersion devolve -32602 e HTTP 400
+PASS 05 _meta sem clientCapabilities devolve -32602 e HTTP 400
+PASS 06 tool inexistente e recusada, por -32602 ou por isError
+PASS 07 resources/read de politica://uso devolve a politica
+PASS 08 resources/read de URI inexistente devolve -32602
+PASS 09 sala inexistente devolve isError com a mensagem exata
+PASS 10 fora da janela devolve isError com a mensagem exata
+PASS 11 duracao acima de 2h devolve isError com a mensagem exata
+PASS 12 intervalo invertido devolve isError com a mensagem exata
+PASS 13 conflito devolve input_required com inputRequests e requestState
+PASS 14 a elicitation e form mode e oferece as alternativas na ordem certa
+PASS 15 conflito sem a capability elicitation devolve -32021 e HTTP 400
+PASS 16 retry com inputResponses e requestState conclui a reserva
+PASS 17 requestState adulterado e rejeitado com -32602
+PASS 18 argumentos adulterados no retry nao tomam efeito
+PASS 19 recusa conclui sem reservar e sem isError
+PASS 20 conflito sem alternativa possivel devolve isError com a mensagem exata
+PASS 21 agent card responde 200 no well-known com JSON
+PASS 22 o card declara a interface JSON-RPC com url e versao 1.0
+PASS 23 o card declara a skill reservar-sala
+PASS 24 SendMessage com sala livre conclui a Task
+PASS 25 o artifact chama reserva e traz a versao da politica
+PASS 26 GetTask devolve id, contextId e estado corrente
+PASS 27 SendMessage com sala ocupada pausa a Task
+PASS 28 a Task pausada lista as alternativas na ordem certa
+PASS 29 escolha fora do enum mantem a Task pausada
+PASS 30 a continuacao conclui a Task na sala escolhida
+PASS 31 SendMessage em Task terminal e recusado
+PASS 32 a recusa termina a Task em CANCELED
+PASS 33 duas Tasks pausadas ao mesmo tempo concluem cada uma com a sua reserva
+PASS 34 nenhuma resposta A2A carrega o requestState
+PASS 35 sala inexistente termina a Task em FAILED com a mensagem da tool
+PASS 36 o agente e deterministico: o mesmo pedido produz a mesma pausa
+
+resumo: 36 passaram, 0 falharam, de 36 verificacoes
+```
